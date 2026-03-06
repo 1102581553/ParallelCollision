@@ -97,12 +97,14 @@ static PushableComponent* tryGetPushableComponent(Actor& actor) {
     return comp.has_value() ? &comp.value() : nullptr;
 }
 
-static std::vector<CollisionEvent> detectCollisionsParallel(
+// 返回检测耗时（微秒）
+static std::pair<std::vector<CollisionEvent>, long long> detectCollisionsParallel(
     const std::vector<EntitySnapshot>& snapshots,
     size_t numThreads
 ) {
+    auto detectStart = std::chrono::steady_clock::now();
     std::vector<CollisionEvent> events;
-    if (snapshots.empty()) return events;
+    if (snapshots.empty()) return {events, 0};
 
     const size_t N = snapshots.size();
     std::mutex eventsMutex;
@@ -116,7 +118,6 @@ static std::vector<CollisionEvent> detectCollisionsParallel(
         size_t end = std::min(start + chunkSize, N);
         if (start >= end) break;
 
-        // 修复：显式捕获 N
         futures.push_back(std::async(std::launch::async, [&snapshots, N, start, end, &events, &eventsMutex]() {
             std::vector<CollisionEvent> localEvents;
             for (size_t i = start; i < end; ++i) {
@@ -142,10 +143,14 @@ static std::vector<CollisionEvent> detectCollisionsParallel(
         f.get();
     }
 
-    return events;
+    auto detectEnd = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(detectEnd - detectStart).count();
+    return {std::move(events), elapsed};
 }
 
-static void processCollisionEvents(Level& level, const std::vector<CollisionEvent>& events) {
+// 返回处理耗时（微秒）
+static long long processCollisionEvents(Level& level, const std::vector<CollisionEvent>& events) {
+    auto processStart = std::chrono::steady_clock::now();
     for (const auto& e : events) {
         Actor* actorA = level.fetchEntity(e.a, false);
         Actor* actorB = level.fetchEntity(e.b, false);
@@ -162,6 +167,8 @@ static void processCollisionEvents(Level& level, const std::vector<CollisionEven
 
         g_processingParallel = false;
     }
+    auto processEnd = std::chrono::steady_clock::now();
+    return std::chrono::duration_cast<std::chrono::microseconds>(processEnd - processStart).count();
 }
 
 using PushFunc = void(PushableComponent::*)(Actor&, Actor&, bool);
@@ -194,10 +201,13 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
     &Level::$tick,
     void
 ) {
+    auto tickStart = std::chrono::steady_clock::now();
+
     if (config.enabled) {
         auto actors = this->getRuntimeActorList();
         lastEntityCount = actors.size();
 
+        auto snapshotStart = std::chrono::steady_clock::now();
         std::vector<EntitySnapshot> snapshots;
         snapshots.reserve(actors.size());
         for (Actor* actor : actors) {
@@ -208,13 +218,26 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
                 .isPlayer = actor->isPlayer()
             });
         }
+        auto snapshotEnd = std::chrono::steady_clock::now();
+        auto snapshotElapsed = std::chrono::duration_cast<std::chrono::microseconds>(snapshotEnd - snapshotStart).count();
 
         size_t numThreads = std::max(1u, std::thread::hardware_concurrency());
-        auto events = detectCollisionsParallel(snapshots, numThreads);
+        auto [events, detectElapsed] = detectCollisionsParallel(snapshots, numThreads);
         totalDetected += events.size();
         totalTicks++;
 
-        processCollisionEvents(*this, events);
+        auto processElapsed = processCollisionEvents(*this, events);
+
+        auto tickEnd = std::chrono::steady_clock::now();
+        auto totalElapsed = std::chrono::duration_cast<std::chrono::microseconds>(tickEnd - tickStart).count();
+
+        if (config.debug) {
+            getLogger().info(
+                "Tick debug: entities={}, events={}, threads={}, snapshot={}us, detect={}us, process={}us, total={}us",
+                actors.size(), events.size(), numThreads,
+                snapshotElapsed, detectElapsed, processElapsed, totalElapsed
+            );
+        }
     }
 
     origin();
