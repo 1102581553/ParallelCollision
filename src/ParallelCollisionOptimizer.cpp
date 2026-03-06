@@ -33,6 +33,9 @@ static size_t lastEntityCount = 0;
 
 static bool g_processingParallel = false;
 
+// 网格大小（每个单元格边长，单位：方块）
+constexpr int GRID_CELL_SIZE = 16;
+
 static ll::io::Logger& getLogger() {
     if (!log) {
         log = ll::io::LoggerRegistry::getInstance().getOrCreate("ParallelCollision");
@@ -83,6 +86,7 @@ static void stopDebugTask() { debugTaskRunning = false; }
 struct EntitySnapshot {
     ActorUniqueID uid;
     AABB aabb;
+    Vec3 pos;           // 用于网格定位
     bool isPlayer;
 };
 
@@ -97,9 +101,42 @@ static PushableComponent* tryGetPushableComponent(Actor& actor) {
     return comp.has_value() ? &comp.value() : nullptr;
 }
 
+// 网格坐标
+struct GridCoord {
+    int x, y;
+    bool operator==(const GridCoord& other) const { return x == other.x && y == other.y; }
+};
+struct GridCoordHash {
+    std::size_t operator()(const GridCoord& c) const {
+        return std::hash<int>()(c.x) ^ (std::hash<int>()(c.y) << 1);
+    }
+};
+
+// 网格：每个单元格存储实体索引列表
+using Grid = std::unordered_map<GridCoord, std::vector<size_t>, GridCoordHash>;
+
+// 从位置获取网格坐标
+static GridCoord getGridCoord(const Vec3& pos) {
+    return {
+        static_cast<int>(std::floor(pos.x / GRID_CELL_SIZE)),
+        static_cast<int>(std::floor(pos.z / GRID_CELL_SIZE)) // 使用 x,z 平面
+    };
+}
+
+// 构建网格索引
+static Grid buildGrid(const std::vector<EntitySnapshot>& snapshots) {
+    Grid grid;
+    for (size_t i = 0; i < snapshots.size(); ++i) {
+        auto coord = getGridCoord(snapshots[i].pos);
+        grid[coord].push_back(i);
+    }
+    return grid;
+}
+
 // 返回检测耗时（微秒）
 static std::pair<std::vector<CollisionEvent>, long long> detectCollisionsParallel(
     const std::vector<EntitySnapshot>& snapshots,
+    const Grid& grid,
     size_t numThreads
 ) {
     auto detectStart = std::chrono::steady_clock::now();
@@ -118,17 +155,27 @@ static std::pair<std::vector<CollisionEvent>, long long> detectCollisionsParalle
         size_t end = std::min(start + chunkSize, N);
         if (start >= end) break;
 
-        futures.push_back(std::async(std::launch::async, [&snapshots, N, start, end, &events, &eventsMutex]() {
+        futures.push_back(std::async(std::launch::async, [&snapshots, &grid, start, end, &events, &eventsMutex]() {
             std::vector<CollisionEvent> localEvents;
             for (size_t i = start; i < end; ++i) {
                 const auto& si = snapshots[i];
-                for (size_t j = i + 1; j < N; ++j) {
-                    const auto& sj = snapshots[j];
-                    if (config.skipPlayers && (si.isPlayer || sj.isPlayer)) {
-                        continue;
-                    }
-                    if (si.aabb.intersects(sj.aabb)) {
-                        localEvents.push_back({si.uid, sj.uid});
+                GridCoord center = getGridCoord(si.pos);
+                // 遍历相邻 9 个单元格
+                for (int dx = -1; dx <= 1; ++dx) {
+                    for (int dy = -1; dy <= 1; ++dy) {
+                        GridCoord neighbor = {center.x + dx, center.y + dy};
+                        auto it = grid.find(neighbor);
+                        if (it == grid.end()) continue;
+                        for (size_t j : it->second) {
+                            if (j <= i) continue; // 只检查 i < j，避免重复
+                            const auto& sj = snapshots[j];
+                            if (config.skipPlayers && (si.isPlayer || sj.isPlayer)) {
+                                continue;
+                            }
+                            if (si.aabb.intersects(sj.aabb)) {
+                                localEvents.push_back({si.uid, sj.uid});
+                            }
+                        }
                     }
                 }
             }
@@ -148,7 +195,6 @@ static std::pair<std::vector<CollisionEvent>, long long> detectCollisionsParalle
     return {std::move(events), elapsed};
 }
 
-// 返回处理耗时（微秒）
 static long long processCollisionEvents(Level& level, const std::vector<CollisionEvent>& events) {
     auto processStart = std::chrono::steady_clock::now();
     for (const auto& e : events) {
@@ -215,14 +261,20 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
             snapshots.push_back({
                 .uid = actor->getOrCreateUniqueID(),
                 .aabb = actor->getAABB(),
+                .pos = actor->getPosition(),
                 .isPlayer = actor->isPlayer()
             });
         }
         auto snapshotEnd = std::chrono::steady_clock::now();
         auto snapshotElapsed = std::chrono::duration_cast<std::chrono::microseconds>(snapshotEnd - snapshotStart).count();
 
+        auto gridStart = std::chrono::steady_clock::now();
+        Grid grid = buildGrid(snapshots);
+        auto gridEnd = std::chrono::steady_clock::now();
+        auto gridElapsed = std::chrono::duration_cast<std::chrono::microseconds>(gridEnd - gridStart).count();
+
         size_t numThreads = std::max(1u, std::thread::hardware_concurrency());
-        auto [events, detectElapsed] = detectCollisionsParallel(snapshots, numThreads);
+        auto [events, detectElapsed] = detectCollisionsParallel(snapshots, grid, numThreads);
         totalDetected += events.size();
         totalTicks++;
 
@@ -233,9 +285,9 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
 
         if (config.debug) {
             getLogger().info(
-                "Tick debug: entities={}, events={}, threads={}, snapshot={}us, detect={}us, process={}us, total={}us",
+                "Tick debug: entities={}, events={}, threads={}, snapshot={}us, grid={}us, detect={}us, process={}us, total={}us",
                 actors.size(), events.size(), numThreads,
-                snapshotElapsed, detectElapsed, processElapsed, totalElapsed
+                snapshotElapsed, gridElapsed, detectElapsed, processElapsed, totalElapsed
             );
         }
     }
