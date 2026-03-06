@@ -116,7 +116,8 @@ static std::vector<CollisionEvent> detectCollisionsParallel(
         size_t end = std::min(start + chunkSize, N);
         if (start >= end) break;
 
-        futures.push_back(std::async(std::launch::async, [&snapshots, start, end, &events, &eventsMutex]() {
+        // 修复：显式捕获 N
+        futures.push_back(std::async(std::launch::async, [&snapshots, N, start, end, &events, &eventsMutex]() {
             std::vector<CollisionEvent> localEvents;
             for (size_t i = start; i < end; ++i) {
                 const auto& si = snapshots[i];
