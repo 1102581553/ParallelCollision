@@ -20,6 +20,7 @@
 #include <future>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace parallel_collision {
 
@@ -33,7 +34,6 @@ static size_t lastEntityCount = 0;
 
 static bool g_processingParallel = false;
 
-// 网格大小（每个单元格边长，单位：方块）
 constexpr int GRID_CELL_SIZE = 16;
 
 static ll::io::Logger& getLogger() {
@@ -86,7 +86,7 @@ static void stopDebugTask() { debugTaskRunning = false; }
 struct EntitySnapshot {
     ActorUniqueID uid;
     AABB aabb;
-    Vec3 pos;           // 用于网格定位
+    Vec3 pos;
     bool isPlayer;
 };
 
@@ -101,7 +101,6 @@ static PushableComponent* tryGetPushableComponent(Actor& actor) {
     return comp.has_value() ? &comp.value() : nullptr;
 }
 
-// 网格坐标
 struct GridCoord {
     int x, y;
     bool operator==(const GridCoord& other) const { return x == other.x && y == other.y; }
@@ -111,19 +110,15 @@ struct GridCoordHash {
         return std::hash<int>()(c.x) ^ (std::hash<int>()(c.y) << 1);
     }
 };
-
-// 网格：每个单元格存储实体索引列表
 using Grid = std::unordered_map<GridCoord, std::vector<size_t>, GridCoordHash>;
 
-// 从位置获取网格坐标
 static GridCoord getGridCoord(const Vec3& pos) {
     return {
         static_cast<int>(std::floor(pos.x / GRID_CELL_SIZE)),
-        static_cast<int>(std::floor(pos.z / GRID_CELL_SIZE)) // 使用 x,z 平面
+        static_cast<int>(std::floor(pos.z / GRID_CELL_SIZE))
     };
 }
 
-// 构建网格索引
 static Grid buildGrid(const std::vector<EntitySnapshot>& snapshots) {
     Grid grid;
     for (size_t i = 0; i < snapshots.size(); ++i) {
@@ -133,7 +128,6 @@ static Grid buildGrid(const std::vector<EntitySnapshot>& snapshots) {
     return grid;
 }
 
-// 返回检测耗时（微秒）
 static std::pair<std::vector<CollisionEvent>, long long> detectCollisionsParallel(
     const std::vector<EntitySnapshot>& snapshots,
     const Grid& grid,
@@ -160,14 +154,13 @@ static std::pair<std::vector<CollisionEvent>, long long> detectCollisionsParalle
             for (size_t i = start; i < end; ++i) {
                 const auto& si = snapshots[i];
                 GridCoord center = getGridCoord(si.pos);
-                // 遍历相邻 9 个单元格
                 for (int dx = -1; dx <= 1; ++dx) {
                     for (int dy = -1; dy <= 1; ++dy) {
                         GridCoord neighbor = {center.x + dx, center.y + dy};
                         auto it = grid.find(neighbor);
                         if (it == grid.end()) continue;
                         for (size_t j : it->second) {
-                            if (j <= i) continue; // 只检查 i < j，避免重复
+                            if (j <= i) continue;
                             const auto& sj = snapshots[j];
                             if (config.skipPlayers && (si.isPlayer || sj.isPlayer)) {
                                 continue;
@@ -195,9 +188,38 @@ static std::pair<std::vector<CollisionEvent>, long long> detectCollisionsParalle
     return {std::move(events), elapsed};
 }
 
-static long long processCollisionEvents(Level& level, const std::vector<CollisionEvent>& events) {
-    auto processStart = std::chrono::steady_clock::now();
-    for (const auto& e : events) {
+// 贪心分组：将事件分成多个互不相交的批次（每个批次内所有事件的实体集无重叠）
+static std::vector<std::vector<CollisionEvent>> partitionEvents(const std::vector<CollisionEvent>& events) {
+    std::vector<std::vector<CollisionEvent>> batches;
+    if (events.empty()) return batches;
+
+    // 使用贪心算法：对于每个事件，尝试放入已有的批次，如果与批次内任何实体的ID冲突，则创建新批次
+    // 为了加速，我们维护每个批次当前占用的实体集合
+    std::vector<std::unordered_set<ActorUniqueID>> batchOccupied;
+    for (const auto& ev : events) {
+        bool placed = false;
+        for (size_t i = 0; i < batches.size(); ++i) {
+            // 检查冲突
+            if (batchOccupied[i].count(ev.a) == 0 && batchOccupied[i].count(ev.b) == 0) {
+                batches[i].push_back(ev);
+                batchOccupied[i].insert(ev.a);
+                batchOccupied[i].insert(ev.b);
+                placed = true;
+                break;
+            }
+        }
+        if (!placed) {
+            // 创建新批次
+            batches.push_back({ev});
+            batchOccupied.push_back({ev.a, ev.b});
+        }
+    }
+    return batches;
+}
+
+// 处理单个批次的事件（在子线程中调用）
+static void processBatch(Level& level, const std::vector<CollisionEvent>& batch) {
+    for (const auto& e : batch) {
         Actor* actorA = level.fetchEntity(e.a, false);
         Actor* actorB = level.fetchEntity(e.b, false);
         if (!actorA || !actorB) continue;
@@ -206,13 +228,71 @@ static long long processCollisionEvents(Level& level, const std::vector<Collisio
         PushableComponent* pushB = tryGetPushableComponent(*actorB);
         if (!pushA && !pushB) continue;
 
-        g_processingParallel = true;
+        // 注意：这里不再设置全局标志，因为我们在并行处理批次，原版推动已被钩子禁用，除非玩家放行。
+        // 但批次处理时，我们仍然需要允许推动，所以应设置 g_processingParallel = true。
+        // 然而 g_processingParallel 是全局布尔，如果多个线程同时设置，可能互相覆盖。
+        // 改为在每个线程内临时设置为 true，但需要考虑并发。由于原版推动钩子只读该标志，多个线程同时写可能导致数据竞争（非原子）。
+        // 我们改为使用 thread_local 变量，但钩子中无法访问线程局部变量。
+        // 另一种方法：在钩子中检查当前线程是否正在处理并行事件。我们可以通过一个线程局部标志来实现。
+        // 这里为了简化，我们暂时不在钩子中区分，而是依赖 skipPlayers 配置和玩家放行逻辑。
+        // 实际上，批次处理时，我们希望推动被执行，但原版推动钩子会拦截非玩家推动（因为 g_processingParallel 为 false 且非玩家会跳过）。
+        // 因此我们必须设置一个标志。为了线程安全，我们可以使用原子布尔，但每个线程需要自己的标志。最好用 thread_local。
+        // 由于我们无法修改钩子来读取 thread_local，我们可以改为在钩子中检查另一个全局原子计数器，表示当前正在处理批次的线程数。但这也不可靠。
+        // 简单方案：在 processBatch 中直接调用 push，不依赖钩子，因为我们已经禁用了原版推动？实际上原版推动仍在钩子中被拦截，我们需要确保推动被执行。
+        // 我们可以临时设置一个 thread_local 标志，然后在钩子中判断该标志。但钩子函数是静态的，无法访问 thread_local 除非声明为线程局部。
+        // 我们将声明一个 thread_local bool t_processingBatch = false，在 processBatch 中设置为 true，钩子中检查它。
+        // 注意：钩子中需要访问 thread_local 变量，必须在文件作用域声明。
+    }
+}
+
+// 线程局部标志，用于钩子判断
+thread_local bool t_processingBatch = false;
+
+// 处理批次（实际执行推动）
+static void processBatchImpl(Level& level, const std::vector<CollisionEvent>& batch) {
+    t_processingBatch = true;
+    for (const auto& e : batch) {
+        Actor* actorA = level.fetchEntity(e.a, false);
+        Actor* actorB = level.fetchEntity(e.b, false);
+        if (!actorA || !actorB) continue;
+
+        PushableComponent* pushA = tryGetPushableComponent(*actorA);
+        PushableComponent* pushB = tryGetPushableComponent(*actorB);
+        if (!pushA && !pushB) continue;
 
         if (pushA) pushA->push(*actorA, *actorB, false);
         if (pushB) pushB->push(*actorB, *actorA, false);
-
-        g_processingParallel = false;
     }
+    t_processingBatch = false;
+}
+
+// 并行处理所有批次
+static long long processCollisionEventsParallel(Level& level, const std::vector<CollisionEvent>& events) {
+    auto processStart = std::chrono::steady_clock::now();
+
+    // 分组
+    auto groupStart = std::chrono::steady_clock::now();
+    auto batches = partitionEvents(events);
+    auto groupEnd = std::chrono::steady_clock::now();
+    auto groupElapsed = std::chrono::duration_cast<std::chrono::microseconds>(groupEnd - groupStart).count();
+
+    if (config.debug) {
+        getLogger().info("Partitioned {} events into {} batches, took {} us", events.size(), batches.size(), groupElapsed);
+    }
+
+    // 并行处理每个批次
+    std::vector<std::future<void>> futures;
+    futures.reserve(batches.size());
+    for (const auto& batch : batches) {
+        futures.push_back(std::async(std::launch::async, [&level, &batch]() {
+            processBatchImpl(level, batch);
+        }));
+    }
+
+    for (auto& f : futures) {
+        f.get();
+    }
+
     auto processEnd = std::chrono::steady_clock::now();
     return std::chrono::duration_cast<std::chrono::microseconds>(processEnd - processStart).count();
 }
@@ -229,10 +309,12 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
     class Actor& other,
     bool pushSelfOnly
 ) {
-    if (g_processingParallel) {
+    // 如果当前线程正在处理并行批次，则允许执行
+    if (t_processingBatch) {
         origin(owner, other, pushSelfOnly);
         return;
     }
+    // 或者如果是玩家且配置跳过玩家，则允许原版推动
     if (config.skipPlayers && (owner.isPlayer() || other.isPlayer())) {
         origin(owner, other, pushSelfOnly);
         return;
@@ -278,7 +360,7 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
         totalDetected += events.size();
         totalTicks++;
 
-        auto processElapsed = processCollisionEvents(*this, events);
+        auto processElapsed = processCollisionEventsParallel(*this, events);
 
         auto tickEnd = std::chrono::steady_clock::now();
         auto totalElapsed = std::chrono::duration_cast<std::chrono::microseconds>(tickEnd - tickStart).count();
