@@ -247,6 +247,7 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
         origin(owner, other, pushSelfOnly);
         return;
     }
+    // 否则跳过
 }
 
 LL_AUTO_TYPE_INSTANCE_HOOK(
@@ -256,13 +257,10 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
     &Level::$tick,
     void
 ) {
-    auto tickStart = std::chrono::steady_clock::now();
-
     if (config.enabled) {
         auto actors = this->getRuntimeActorList();
         lastEntityCount = actors.size();
 
-        auto snapshotStart = std::chrono::steady_clock::now();
         std::vector<EntitySnapshot> snapshots;
         snapshots.reserve(actors.size());
         for (Actor* actor : actors) {
@@ -274,31 +272,14 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
                 .isPlayer = actor->isPlayer()
             });
         }
-        auto snapshotEnd = std::chrono::steady_clock::now();
-        auto snapshotElapsed = std::chrono::duration_cast<std::chrono::microseconds>(snapshotEnd - snapshotStart).count();
 
-        auto gridStart = std::chrono::steady_clock::now();
         Grid grid = buildGrid(snapshots);
-        auto gridEnd = std::chrono::steady_clock::now();
-        auto gridElapsed = std::chrono::duration_cast<std::chrono::microseconds>(gridEnd - gridStart).count();
-
         size_t numThreads = std::max(1u, std::thread::hardware_concurrency());
         auto [events, detectElapsed] = detectCollisionsParallel(snapshots, grid, numThreads);
         totalDetected += events.size();
         totalTicks++;
 
-        auto processElapsed = processCollisionEvents(*this, events);
-
-        auto tickEnd = std::chrono::steady_clock::now();
-        auto totalElapsed = std::chrono::duration_cast<std::chrono::microseconds>(tickEnd - tickStart).count();
-
-        if (config.debug) {
-            getLogger().info(
-                "Tick debug: entities={}, events={}, threads={}, snapshot={}us, grid={}us, detect={}us, process={}us, total={}us",
-                actors.size(), events.size(), numThreads,
-                snapshotElapsed, gridElapsed, detectElapsed, processElapsed, totalElapsed
-            );
-        }
+        processCollisionEvents(*this, events);
     }
 
     origin();
