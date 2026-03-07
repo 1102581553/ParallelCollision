@@ -8,7 +8,7 @@
 #include <mc/world/level/Level.h>
 #include <mc/world/actor/Actor.h>
 #include <mc/world/actor/ActorCategory.h>
-#include <mc/world/actor/ActorType.h>          // 新增：用于判断掉落物
+#include <mc/world/actor/ActorType.h>          // 用于判断掉落物
 #include <mc/world/phys/AABB.h>
 #include <mc/legacy/ActorUniqueID.h>
 #include <mc/entity/components_json_legacy/PushableComponent.h>
@@ -88,7 +88,7 @@ struct EntitySnapshot {
     AABB aabb;
     Vec3 pos;
     bool isPlayer;
-    bool isItem;          // 新增：是否为掉落物
+    bool isItem;          // 是否为掉落物
 };
 
 struct CollisionEvent {
@@ -165,7 +165,7 @@ static std::pair<std::vector<CollisionEvent>, long long> detectCollisionsParalle
                             if (j <= i) continue;
                             const auto& sj = snapshots[j];
 
-                            // 新增：跳过掉落物参与的碰撞
+                            // 跳过掉落物参与的碰撞
                             if (si.isItem || sj.isItem) continue;
 
                             if (config.skipPlayers && (si.isPlayer || sj.isPlayer)) {
@@ -273,7 +273,8 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
                 .aabb = actor->getAABB(),
                 .pos = actor->getPosition(),
                 .isPlayer = actor->isPlayer(),
-                .isItem = actor->isType(::ActorType::Item)   // 判断是否为掉落物
+                // 修正点：使用正确的枚举值 ItemEntity
+                .isItem = actor->isType(::ActorType::ItemEntity)
             });
         }
 
