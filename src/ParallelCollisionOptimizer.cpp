@@ -8,6 +8,7 @@
 #include <mc/world/level/Level.h>
 #include <mc/world/actor/Actor.h>
 #include <mc/world/actor/ActorCategory.h>
+#include <mc/world/actor/ActorType.h>          // 新增：用于判断掉落物
 #include <mc/world/phys/AABB.h>
 #include <mc/legacy/ActorUniqueID.h>
 #include <mc/entity/components_json_legacy/PushableComponent.h>
@@ -87,6 +88,7 @@ struct EntitySnapshot {
     AABB aabb;
     Vec3 pos;
     bool isPlayer;
+    bool isItem;          // 新增：是否为掉落物
 };
 
 struct CollisionEvent {
@@ -162,6 +164,10 @@ static std::pair<std::vector<CollisionEvent>, long long> detectCollisionsParalle
                         for (size_t j : it->second) {
                             if (j <= i) continue;
                             const auto& sj = snapshots[j];
+
+                            // 新增：跳过掉落物参与的碰撞
+                            if (si.isItem || sj.isItem) continue;
+
                             if (config.skipPlayers && (si.isPlayer || sj.isPlayer)) {
                                 continue;
                             }
@@ -195,7 +201,6 @@ static long long processCollisionEvents(Level& level, const std::vector<Collisio
         Actor* actorB = level.fetchEntity(e.b, false);
         if (!actorA || !actorB) continue;
 
-        // 存活检查
         if (!actorA->isAlive() || !actorB->isAlive()) continue;
 
         PushableComponent* pushA = tryGetPushableComponent(*actorA);
@@ -204,7 +209,6 @@ static long long processCollisionEvents(Level& level, const std::vector<Collisio
 
         g_processingParallel = true;
 
-        // 异常捕获包装 push 调用
         try {
             if (pushA) pushA->push(*actorA, *actorB, false);
         } catch (const std::exception& e) {
@@ -247,7 +251,6 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
         origin(owner, other, pushSelfOnly);
         return;
     }
-    // 否则跳过
 }
 
 LL_AUTO_TYPE_INSTANCE_HOOK(
@@ -269,7 +272,8 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
                 .uid = actor->getOrCreateUniqueID(),
                 .aabb = actor->getAABB(),
                 .pos = actor->getPosition(),
-                .isPlayer = actor->isPlayer()
+                .isPlayer = actor->isPlayer(),
+                .isItem = actor->isType(::ActorType::Item)   // 判断是否为掉落物
             });
         }
 
